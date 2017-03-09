@@ -1,0 +1,9 @@
+[Unit]
+Description=redir daemon that runs on port %i
+
+[Service]
+Restart=always
+ExecStart=/sbin/redir %i
+
+[Install]
+WantedBy=multi-user.target

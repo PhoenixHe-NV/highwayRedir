@@ -88,6 +88,9 @@ func connFwd(src, dst net.Conn) {
 	buf := bufPool.Get().([]byte)
 	defer bufPool.Put(buf)
 
+	io.CopyBuffer(src, dst, buf)
+	return
+
 	for {
 		src.SetDeadline(time.Now().Add(30 * time.Second))
 		nr, er := src.Read(buf)

@@ -1,14 +1,15 @@
 package main
 
 import (
+	"runtime"
 	"io"
 	"net"
 	"syscall"
 	"fmt"
 	"os"
 	"unsafe"
-	"time"
 	"sync"
+	"time"
 )
 
 func checkErr(err error, msg string) {
@@ -19,14 +20,8 @@ func checkErr(err error, msg string) {
 	os.Exit(-1)
 }
 
-func setIpTransparent(listener *net.TCPListener) error {
-	file, err := listener.File()
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	err = syscall.SetsockoptInt(int(file.Fd()), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
+func setIpTransparent(fd uintptr) error {
+	err := syscall.SetsockoptInt(int(fd), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
 	if err != nil {
 		return err
 	}
@@ -34,16 +29,10 @@ func setIpTransparent(listener *net.TCPListener) error {
 	return nil
 }
 
-func getOriginalDestTproxy(conn *net.TCPConn) (*net.TCPAddr, error) {
-	file, err := conn.File()
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
+func getOriginalDestTproxy(fd uintptr) (*net.TCPAddr, error) {
 	var addr syscall.RawSockaddrAny
 	var addrlen int = syscall.SizeofSockaddrAny
-	_, _, e1 := syscall.RawSyscall(syscall.SYS_GETSOCKNAME, file.Fd(),
+	_, _, e1 := syscall.RawSyscall(syscall.SYS_GETSOCKNAME, fd,
 		uintptr(unsafe.Pointer(&addr)), uintptr(unsafe.Pointer(&addrlen)))
 	if e1 != 0 {
 		return nil, e1
@@ -63,16 +52,10 @@ func getOriginalDestTproxy(conn *net.TCPConn) (*net.TCPAddr, error) {
 }
 
 
-func getOriginalDestRedir(conn *net.TCPConn) (*net.TCPAddr, error) {
-	file, err := conn.File()
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
+func getOriginalDestRedir(fd uintptr) (*net.TCPAddr, error) {
 	var addr syscall.RawSockaddrAny
 	var addrlen int = syscall.SizeofSockaddrAny
-	_, _, e1 := syscall.Syscall6(syscall.SYS_GETSOCKOPT, file.Fd(), syscall.SOL_IP, 80,
+	_, _, e1 := syscall.Syscall6(syscall.SYS_GETSOCKOPT, fd, syscall.SOL_IP, 80,
 		uintptr(unsafe.Pointer(&addr)), uintptr(unsafe.Pointer(&addrlen)), 0)
 	if e1 != 0 {
 		return nil, e1
@@ -98,57 +81,84 @@ var bufPool = sync.Pool{
 	},
 }
 
-func connFwd(a, b *net.TCPConn, die chan int) {
-	io.Copy(a, b)
-	die <- 1
-	return
+func connFwd(src, dst net.Conn) {
+	defer src.Close()
+	defer dst.Close()
+
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	for {
+		src.SetDeadline(time.Now().Add(30 * time.Second))
+		nr, er := src.Read(buf)
+
+		if nr > 0 {
+			dst.SetDeadline(time.Now().Add(5 * time.Second))
+			nw, ew := dst.Write(buf[0:nr])
+			if ew != nil || nr != nw {
+				break
+			}
+		}
+		if er == io.EOF || er != nil {
+			break
+		}
+	}
 }
 
 func forwardConn(origConn *net.TCPConn) {
-	dst, err := getOriginalDestRedir(origConn)
+	origStr := origConn.RemoteAddr().String()
+
+	file, err := origConn.File()
+	origConn.Close()
 	if err != nil {
-		dst, err = getOriginalDestTproxy(origConn)
-		if err != nil {
-			fmt.Println("Unable to get original dest for", origConn.RemoteAddr())
-			origConn.Close()
-			return
-		}
+		fmt.Println("Unable to dup fd for", origStr)
+		return
+	}
+
+	fd := file.Fd()
+	dst, err := getOriginalDestTproxy(fd)
+	if err != nil {
+		fmt.Println("Unable to get original dest for", origStr)
+		file.Close()
+		return
+	}
+
+	conn, err := net.FileConn(file)
+	if err != nil {
+		fmt.Println("Unable to dup new origConn")
+		file.Close()
+		return
 	}
 
 	dstStr := dst.String()
-	fmt.Println("Accept connection from", origConn.RemoteAddr(), "to", dstStr)
+	fmt.Println("Accept connection from", origStr, "to", dstStr, "dupFd:", fd)
+	file.Close()
 
-	fwdConn_, err := net.DialTimeout("tcp4", dstStr, 5 * time.Second)
+	fwdConn, err := net.DialTCP("tcp4", nil, dst)
 	if err != nil {
 		fmt.Println("Cannot connect to", dst)
-		origConn.Close()
+		conn.Close()
 		return
 	}
-	fwdConn := fwdConn_.(*net.TCPConn)
 
-	p1die := make(chan int)
-	go connFwd(origConn, fwdConn, p1die)
-	p2die := make(chan int)
-	go connFwd(fwdConn, origConn, p2die)
+	go connFwd(conn, fwdConn)
+	connFwd(fwdConn, conn)
 
-	select {
-	case <-p1die:
-	case <-p2die:
-	}
-
-	origConn.Close()
-	fwdConn.Close()
-
-	fmt.Println("Close connection from", origConn.RemoteAddr(), "to", dstStr)
+	fmt.Println("Close connection from", origStr, "to", dstStr)
 }
 
 func main() {
+	fmt.Println("runtime.NumCPU():", runtime.NumCPU())
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	addr, _ := net.ResolveTCPAddr("tcp4", ":" + os.Args[1])
 	listener, err := net.ListenTCP("tcp4", addr)
 	checkErr(err, "listen")
 
-	err = setIpTransparent(listener)
+	file, err := listener.File()
+	err = setIpTransparent(file.Fd())
 	checkErr(err, "set IP_TRANSPARENT")
+	file.Close()
 
 	for {
 		conn, err := listener.AcceptTCP()
